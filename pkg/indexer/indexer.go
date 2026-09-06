@@ -366,11 +366,10 @@ func (i *ChainIndexer) initServices(ctx context.Context, cfg *config.Config, blo
 
 // initHealthServer creates and starts the health server with schema and hub endpoints configured.
 func (i *ChainIndexer) initHealthServer(cfg *config.Config) error {
+	// The configured address is rewritten before the API binds, so probe the bound address.
 	var healthDefraURL string
-	if cfg.DefraDB.URL != "" {
-		healthDefraURL = cfg.DefraDB.URL
-	} else if i.defraNode != nil {
-		healthDefraURL = fmt.Sprintf("http://localhost:%d", defra.GetPort(i.defraNode))
+	if i.defraNode != nil {
+		healthDefraURL = i.defraNode.APIURL
 	}
 	i.healthServer = server.NewHealthServer(cfg.Indexer.HealthServerPort, i, healthDefraURL)
 	if i.defraNode != nil {
