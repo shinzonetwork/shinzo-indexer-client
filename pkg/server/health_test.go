@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -313,19 +315,27 @@ func TestRegistrationHandler_SignError(t *testing.T) {
 
 func TestRegistrationHandler_DefraDBDisconnected(t *testing.T) {
 	t.Parallel()
-	// External URL that fails to connect
 	mock := &mockHealthChecker{
 		healthy:       true,
 		currentBlock:  100,
 		lastProcessed: time.Now(),
 		p2pInfo:       &P2PInfo{Enabled: false},
 	}
-	hs := NewHealthServer(0, mock, "http://192.0.2.1:9181") // Non-routable IP
+
+	var probes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		probes.Add(1)
+		_, _ = w.Write([]byte(`not defradb`))
+	}))
+	defer srv.Close()
+
+	hs := NewHealthServer(0, mock, srv.URL)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/registration", nil)
 	hs.registrationHandler(rec, req)
-	// Should be not ready due to DefraDB disconnect
+
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, int64(1), probes.Load(), "one request should probe DefraDB once")
 }
 
 // --- registrationAppHandler ---
@@ -621,71 +631,96 @@ func TestCheckDefraDB_EmptyURL(t *testing.T) {
 	assert.True(t, hs.checkDefraDB())
 }
 
-func TestCheckDefraDB_Localhost(t *testing.T) {
+func TestCheckDefraDB_ProbeResponse(t *testing.T) {
 	t.Parallel()
-	hs := &HealthServer{defraURL: "http://localhost:9181"}
-	assert.True(t, hs.checkDefraDB())
+
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		expect bool
+	}{
+		{"data", http.StatusOK, `{"data":{"__schema":{"queryType":{"name":"Query"}}}}`, true},
+		{"errors only", http.StatusOK, `{"errors":[{"message":"Cannot query field"}]}`, true},
+		{"errors and data", http.StatusOK, `{"errors":[{"message":"collection not found"}],"data":null}`, true},
+		{"status ignored", http.StatusInternalServerError, `{"data":null}`, true},
+		{"json without graphql keys", http.StatusOK, `{"status":"ok"}`, false},
+		{"not json", http.StatusOK, `Healthy`, false},
+		{"json array", http.StatusOK, `[]`, false},
+		{"empty body", http.StatusOK, ``, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			hs := &HealthServer{defraURL: srv.URL}
+			assert.Equal(t, tc.expect, hs.checkDefraDB())
+		})
+	}
 }
 
-func TestCheckDefraDB_Loopback(t *testing.T) {
+// The path and query are spelled out so a change to the constants fails this test.
+func TestCheckDefraDB_ProbeRequest(t *testing.T) {
 	t.Parallel()
-	hs := &HealthServer{defraURL: "http://127.0.0.1:9181"}
-	assert.True(t, hs.checkDefraDB())
-}
 
-func TestCheckDefraDB_ExternalSuccess(t *testing.T) {
-	t.Parallel()
-	// Use IPv6 loopback listener to avoid the localhost/127.0.0.1 shortcut
-	listener, err := net.Listen("tcp", "[::1]:0")
-	require.NoError(t, err)
+	type probe struct{ method, path, body string }
 
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	got := make(chan probe, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got <- probe{r.Method, r.URL.Path, string(body)}
+		_, _ = w.Write([]byte(`{"data":null}`))
 	}))
-	srv.Listener = listener
-	srv.Start()
 	defer srv.Close()
 
 	hs := &HealthServer{defraURL: srv.URL}
 	assert.True(t, hs.checkDefraDB())
+
+	var req probe
+	select {
+	case req = <-got:
+	default:
+		t.Fatal("no request reached the server")
+	}
+	assert.Equal(t, http.MethodPost, req.method)
+	assert.Equal(t, "/api/v0/graphql", req.path)
+	assert.JSONEq(t, `{"query":"{ __schema { queryType { name } } }"}`, req.body)
 }
 
-func TestCheckDefraDB_ExternalBadRequest(t *testing.T) {
+func TestCheckDefraDB_Unreachable(t *testing.T) {
 	t.Parallel()
-	listener, err := net.Listen("tcp", "[::1]:0")
+	// Bind then close so the port has no listener.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+	addr := listener.Addr().String()
+	require.NoError(t, listener.Close())
 
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-	}))
-	srv.Listener = listener
-	srv.Start()
-	defer srv.Close()
-
-	hs := &HealthServer{defraURL: srv.URL}
-	assert.True(t, hs.checkDefraDB())
-}
-
-func TestCheckDefraDB_ExternalFailure(t *testing.T) {
-	t.Parallel()
-	hs := &HealthServer{defraURL: "http://192.0.2.1:9181"} // Non-routable
+	hs := &HealthServer{defraURL: "http://" + addr}
 	assert.False(t, hs.checkDefraDB())
 }
 
-func TestCheckDefraDB_ExternalServerError(t *testing.T) {
+func TestDefraQueryURL(t *testing.T) {
 	t.Parallel()
-	listener, err := net.Listen("tcp", "[::1]:0")
-	require.NoError(t, err)
 
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	srv.Listener = listener
-	srv.Start()
-	defer srv.Close()
-
-	hs := &HealthServer{defraURL: srv.URL}
-	assert.False(t, hs.checkDefraDB())
+	cases := map[string]string{
+		"0.0.0.0:9181":              "http://127.0.0.1:9181/api/v0/graphql",
+		"[::]:9181":                 "http://127.0.0.1:9181/api/v0/graphql",
+		":1234":                     "http://127.0.0.1:1234/api/v0/graphql",
+		"localhost:9181":            "http://localhost:9181/api/v0/graphql",
+		"http://localhost:9181":     "http://localhost:9181/api/v0/graphql",
+		"https://defra.example.com": "https://defra.example.com/api/v0/graphql",
+		"http://proxy:8080/defra":   "http://proxy:8080/defra/api/v0/graphql",
+		"http://localhost:9181/":    "http://localhost:9181/api/v0/graphql",
+	}
+	for addr, want := range cases {
+		assert.Equal(t, want, defraQueryURL(addr), addr)
+	}
 }
 
 // --- normalizeHex ---
